@@ -8,6 +8,9 @@
 - 可能仍在执行查询的连接（客户端超时、断开）或发生过 SQL 错误的
   连接，在确认会话状态已清理之前绝不会被再次借出；无法确认的一律
   关闭并更换新连接；
+- 服务端取消（libpq 同步阻塞的 PQcancel）放在独立工作线程执行，
+  事件循环不会被冻结；取消受 cancel_timeout 与外层 cleanup_timeout
+  双重时限约束，超时或报错即关闭旧连接并补位；
 - 排队中的请求不占用连接名额，被取消后立即离开等待队列。
 """
 
@@ -16,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import threading
 import time
 from dataclasses import dataclass
 
@@ -51,12 +55,17 @@ class PoolConfig:
     startup_retries: int = 60      # 启动时等待数据库就绪的重试次数
     retry_interval: float = 1.0
     cleanup_timeout: float = 10.0  # 清理单条连接的总预算
+    cancel_timeout: float = 5.0    # 等待服务端取消返回的最长时间
     drain_grace: float = 5.0       # 等待被取消的查询收尾的时间
     close_timeout: float = 3.0
     # 空闲超过该秒数的连接，借出前先用 SELECT 1 验证活性
     # （防止数据库重启后把已死的空闲连接借给请求）；None 表示从不验证
     checkout_verify_after: float | None = 10.0
     checkout_verify_timeout: float = 3.0
+    # 仅供演示/自测的故障注入："" 关闭；"hang" 让取消调用阻塞
+    # cancel_fault_seconds 秒；"error" 让取消调用直接报错。
+    cancel_fault: str = ""
+    cancel_fault_seconds: float = 20.0
 
 
 class AsyncPool:
@@ -78,11 +87,16 @@ class AsyncPool:
             "released_clean": 0,     # 干净归还次数
             "recycled": 0,           # 脏连接清理后复用次数
             "replaced": 0,           # 脏连接废弃并更换次数
-            "server_cancels": 0,     # 发送的服务端取消次数
+            "server_cancels": 0,     # 发送且成功返回的服务端取消次数
+            "server_cancel_timeouts": 0,  # 服务端取消超过 cancel_timeout 的次数
+            "server_cancel_errors": 0,    # 服务端取消调用报错的次数
             "query_timeouts": 0,     # 查询执行超时次数
             "client_disconnects": 0,  # 查询期间客户端断开次数
             "sql_errors": 0,         # SQL 报错次数
         }
+        # 运行期故障注入开关（仅演示/自测用），取值 "" / "hang" / "error"，
+        # 可由管理接口在不重启进程的情况下切换。
+        self.cancel_fault = config.cancel_fault
 
     # ------------------------------------------------------------ 生命周期
 
@@ -235,6 +249,15 @@ class AsyncPool:
             self.counters["recycled"] += 1
             logger.info("dirty connection cleaned and reused")
         else:
+            # 无法确认会话干净（取消超时/报错、查询迟迟不收尾等）：
+            # 先取消仍在等待该连接的查询任务。Task.cancel() 会同步把
+            # 任务从连接 socket 的读回调上摘除——否则残留的读回调会让
+            # psycopg 的 close() 停在 CLOSE_WAIT、socket 得不到释放，
+            # 服务端也会一直挂着这条后端连接。注意这里绝不 await 该
+            # 任务：它的取消路径仍会操作这条即将关闭的连接，等待会与
+            # close() 互相阻塞；任务异常由 release() 注册的回调消费。
+            if pending is not None and not pending.done():
+                pending.cancel()
             await self._close_quietly(conn)
             self.counters["replaced"] += 1
             if self._closed:
@@ -262,10 +285,17 @@ class AsyncPool:
 
     async def _sanitize_inner(self, conn, pending) -> bool:
         # 1) 查询可能仍在服务端执行：发送服务端取消，并等待客户端侧的
-        #    查询任务观察到取消结果。
+        #    查询任务观察到取消结果。取消调用本身是 libpq 的同步阻塞
+        #    PQcancel()（要新开一条 TCP 连接发送取消信号），因此放到
+        #    独立线程里执行，绝不能堵住事件循环；它还受独立的
+        #    cancel_timeout 与外层 cleanup_timeout 双重时限约束。
         still_running = pending is not None and not pending.done()
         if still_running or conn.info.transaction_status == TransactionStatus.ACTIVE:
-            await self._server_cancel(conn)
+            if not await self._server_cancel(conn):
+                # 取消超时或报错：即便旧查询之后自行结束、会话仍能响应，
+                # 也无法信任这次取消语义，按约定直接判定不可复用
+                # （_recycle 会关掉旧连接并补位一条新连接）。
+                return False
         if still_running:
             try:
                 await asyncio.wait_for(asyncio.shield(pending), self.cfg.drain_grace)
@@ -273,6 +303,8 @@ class AsyncPool:
                 pass
             if not pending.done():
                 return False  # 查询不肯结束 -> 无法信任该会话
+            # 取消成功后也必须等查询真正收尾，再检查会话是否干净，
+            # 避免在连接还处于 ACTIVE / 失败事务状态时误判可复用。
         # 2) 回滚任何遗留 / 失败的事务。
         status = conn.info.transaction_status
         if status in (TransactionStatus.INTRANS, TransactionStatus.INERROR):
@@ -287,14 +319,82 @@ class AsyncPool:
             and conn.info.transaction_status == TransactionStatus.IDLE
         )
 
-    async def _server_cancel(self, conn) -> None:
+    async def _server_cancel(self, conn) -> bool:
+        """发送服务端取消。成功返回 True；超时或报错返回 False。
+
+        psycopg 的 ``AsyncConnection.cancel()`` 内部是 libpq 的同步
+        ``PQcancel()``：它会另开一条 TCP 连接把取消信号发给服务器，
+        对端无响应时该调用会阻塞到 TCP 建连超时（分钟级）。直接在事件
+        循环线程里调用会冻结整个服务（``/pool/stats`` 和其他连接上的
+        请求一起停住），且 ``asyncio.wait_for`` 也无法中断正在执行的
+        同步 C 调用。因此这里把整段取消放到独立工作线程中执行，主循环
+        只在一个 future 上等待，``cancel_timeout`` 到点就能立刻返回。
+        """
+        fault = self.cancel_fault
+        if fault == "error":
+            logger.warning("injected server-cancel error")
+            self.counters["server_cancel_errors"] += 1
+            return False
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+
+        def _consume(fut: asyncio.Future) -> None:
+            # 超时后工作线程仍可能晚些把异常送回这个已被放弃的 future，
+            # 提前消费掉，避免事件循环的“未取异常”告警。
+            if not fut.cancelled():
+                try:
+                    fut.exception()
+                except Exception:
+                    pass
+
+        future.add_done_callback(_consume)
+
+        def _work() -> None:
+            try:
+                if fault == "hang":
+                    # 故障注入：线程内同步睡眠模拟 PQcancel 长时间不返回。
+                    # 只阻塞本工作线程，事件循环照常运转。
+                    time.sleep(self.cfg.cancel_fault_seconds)
+                    raise psycopg.OperationalError(
+                        "injected cancel hang: deadline exceeded")
+                result = conn.cancel()
+                if inspect.isawaitable(result):
+                    # 兼容早期 psycopg 3.2：cancel() 是协程。协程在被
+                    # await 时才取运行中的事件循环，因此在本线程新建一个
+                    # 临时循环来驱动它，不触碰主循环。
+                    inner = asyncio.new_event_loop()
+                    try:
+                        inner.run_until_complete(result)
+                    finally:
+                        inner.close()
+            except Exception as exc:  # noqa: BLE001 - 跨线程回传
+                if not future.done():
+                    loop.call_soon_threadsafe(future.set_exception, exc)
+            else:
+                if not future.done():
+                    loop.call_soon_threadsafe(future.set_result, None)
+
+        threading.Thread(
+            target=_work, name="pg-server-cancel", daemon=True).start()
         try:
-            result = conn.cancel()
-            if inspect.isawaitable(result):  # 兼容不同 psycopg 版本
-                await result
-            self.counters["server_cancels"] += 1
+            await asyncio.wait_for(
+                asyncio.shield(future), self.cfg.cancel_timeout)
+        except asyncio.TimeoutError:
+            self.counters["server_cancel_timeouts"] += 1
+            logger.warning(
+                "server-side cancel did not return within %.1fs; "
+                "the connection will be closed and replaced",
+                self.cfg.cancel_timeout)
+            return False
         except Exception:
-            logger.warning("server-side cancel failed", exc_info=True)
+            self.counters["server_cancel_errors"] += 1
+            logger.warning(
+                "server-side cancel failed; the connection will be "
+                "closed and replaced", exc_info=True)
+            return False
+        self.counters["server_cancels"] += 1
+        return True
 
     async def _close_quietly(self, conn) -> None:
         try:
@@ -340,5 +440,6 @@ class AsyncPool:
                 "cleaning": self._cleaning,
                 "waiting": self._waiting,
                 "opened_connections": self._opened,
+                "cancel_fault": self.cancel_fault,
                 "counters": dict(self.counters),
             }

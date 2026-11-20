@@ -24,6 +24,13 @@ services:
       PGUSER: app
       PGPASSWORD: app
       POOL_SIZE: "4"
+      # 以下均为可选项，缺省使用代码内默认值：
+      # CANCEL_TIMEOUT: "5"    # 等待服务端取消返回的上限（秒）
+      # CLEANUP_TIMEOUT: "10"  # 单条连接清理的总预算（秒）
+      # DRAIN_GRACE: "5"       # 取消成功后等查询收尾的时间（秒）
+      # 演示用故障注入：hang=取消调用卡住，error=取消调用报错
+      # CANCEL_FAULT: ""
+      # CANCEL_FAULT_SECONDS: "20"
     depends_on:
       db:
         condition: service_healthy

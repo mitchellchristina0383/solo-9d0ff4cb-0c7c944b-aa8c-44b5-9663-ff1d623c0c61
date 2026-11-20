@@ -256,6 +256,93 @@ async def t_disconnect(client):
     check("disconnect: normal query after", r.status_code == 200, r.text)
 
 
+async def t_cancel_fault(client):
+    """服务端取消卡住 / 报错：事件循环不冻结，旧连接关闭并补位。
+
+    通过管理接口 /debug/cancel-fault 注入故障（演示/自测能力）：
+    - hang：取消调用在独立工作线程里阻塞，验证等待取消期间
+      /pool/stats 毫秒级响应、其他连接上的商品查询照常；
+      cancel_timeout 后旧连接被关闭并补位（replaced +1）；
+    - error：取消调用直接报错，同样必须更换连接。
+    两种情况下原请求都按 query_timeout 返回 504，且槽位/连接数不越限。
+    """
+    for mode, counter in (("hang", "server_cancel_timeouts"),
+                          ("error", "server_cancel_errors")):
+        before = await stats(client)
+        await client.post("/debug/cancel-fault",
+                          json={"mode": mode, "hang_seconds": 12})
+        # 后台探针：回收期间持续打 /pool/stats 与商品查询，记录最大延迟
+        worst = 0.0
+        probe_errors: list = []
+        stop = asyncio.Event()
+
+        async def probe():
+            nonlocal worst
+            while not stop.is_set():
+                for coro in (client.get("/pool/stats"),
+                             client.post("/query/normal", json={"limit": 1})):
+                    t0 = time.monotonic()
+                    try:
+                        r = await coro
+                        worst = max(worst, time.monotonic() - t0)
+                        if r.status_code != 200:
+                            probe_errors.append(r.status_code)
+                    except Exception as exc:  # noqa: BLE001
+                        probe_errors.append(repr(exc))
+                await asyncio.sleep(0.05)
+
+        ptask = asyncio.create_task(probe())
+        t0 = time.monotonic()
+        r = await client.post("/query/slow", json={
+            "delay_seconds": 8, "acquire_timeout": 5, "query_timeout": 1})
+        dt = time.monotonic() - t0
+        check(f"cancel-fault[{mode}]: 504 on query timeout",
+              r.status_code == 504, f"{r.status_code} {r.text}")
+        check(f"cancel-fault[{mode}]: 504 not delayed by cleanup",
+              0.8 < dt < 2.5, f"{dt:.2f}s")
+
+        s = await wait_pool_idle(client)
+        stop.set()
+        await ptask
+        check(f"cancel-fault[{mode}]: probes all 200",
+              not probe_errors, str(probe_errors[:3]))
+        check(f"cancel-fault[{mode}]: loop stayed responsive (<1s)",
+              worst < 1.0, f"worst={worst:.2f}s")
+        check(f"cancel-fault[{mode}]: slot invariant",
+              s["idle"] + s["in_use"] + s["cleaning"] == s["size"], str(s))
+        check(f"cancel-fault[{mode}]: opened <= size",
+              s["opened_connections"] <= s["size"], str(s))
+        c0, c1 = before["counters"], s["counters"]
+        check(f"cancel-fault[{mode}]: replaced +1",
+              c1["replaced"] - c0["replaced"] == 1,
+              f"{c0['replaced']} -> {c1['replaced']}")
+        check(f"cancel-fault[{mode}]: not recycled",
+              c1["recycled"] == c0["recycled"],
+              f"{c0['recycled']} -> {c1['recycled']}")
+        check(f"cancel-fault[{mode}]: {counter} +1",
+              c1[counter] - c0[counter] == 1, str(c1))
+
+        # 取消信号未送达时后端会把 pg_sleep 跑完；等它自行结束后，
+        # 服务端不应再有活跃查询，连接数回到池上限。
+        deadline = time.monotonic() + 12
+        active = server_count("AND state = 'active'")
+        while active and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            active = server_count("AND state = 'active'")
+        if active is not None:
+            check(f"cancel-fault[{mode}]: no active query left",
+                  active == 0, f"active={active}")
+        n = server_count()
+        if n is not None:
+            check(f"cancel-fault[{mode}]: server conns back to size",
+                  n == POOL_SIZE, f"n={n}")
+
+        await client.post("/debug/cancel-fault", json={"mode": ""})
+        r = await client.post("/query/normal", json={"limit": 1})
+        check(f"cancel-fault[{mode}]: normal query after reset",
+              r.status_code == 200, r.text)
+
+
 async def t_stress(client):
     """取消与归还交错的压力测试：连接数不得越限，其他请求照常完成。"""
     sampler = Sampler(client)
@@ -335,6 +422,7 @@ async def main() -> int:
         await t_query_timeout(client)
         await t_sql_error(client)
         await t_disconnect(client)
+        await t_cancel_fault(client)
         await t_stress(client)
     print()
     if failures:

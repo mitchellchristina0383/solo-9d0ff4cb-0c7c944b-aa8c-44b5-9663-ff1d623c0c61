@@ -77,7 +77,19 @@ class Burst(BaseModel):
     acquire_timeout: float | None = Field(30.0, description="每个请求的等连接超时")
 
 
+class CancelFault(BaseModel):
+    mode: Literal["", "hang", "error"] = Field(
+        "", description="故障注入：'' 关闭；hang=取消调用长时间不返回；error=取消调用报错")
+    hang_seconds: float | None = Field(
+        None, gt=0, le=300, description="hang 模式下取消调用阻塞的秒数")
+
+
 # ---------------------------------------------------------------- 应用装配
+
+def _env_float(name: str) -> float | None:
+    raw = os.environ.get(name)
+    return None if raw is None or raw == "" else float(raw)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -90,6 +102,11 @@ async def lifespan(app: FastAPI):
             user=os.environ.get("PGUSER", "app"),
             password=os.environ.get("PGPASSWORD", "app"),
         ),
+        cleanup_timeout=_env_float("CLEANUP_TIMEOUT") or 10.0,
+        cancel_timeout=_env_float("CANCEL_TIMEOUT") or 5.0,
+        drain_grace=_env_float("DRAIN_GRACE") or 5.0,
+        cancel_fault=os.environ.get("CANCEL_FAULT", ""),
+        cancel_fault_seconds=_env_float("CANCEL_FAULT_SECONDS") or 20.0,
     ))
     await pool.start()
     app.state.pool = pool
@@ -265,6 +282,34 @@ async def query_error(request: Request, opts: ErrorQuery | None = None):
 @app.get("/pool/stats", summary="连接池指标（在用数、等待数等）")
 async def pool_stats(request: Request):
     return await request.app.state.pool.stats()
+
+
+@app.get("/debug/cancel-fault", include_in_schema=False)
+async def get_cancel_fault(request: Request):
+    pool: AsyncPool = request.app.state.pool
+    return {"mode": pool.cancel_fault,
+            "hang_seconds": pool.cfg.cancel_fault_seconds}
+
+
+@app.post("/debug/cancel-fault",
+          summary="故障注入（演示/自测）：模拟服务端取消卡住或报错")
+async def set_cancel_fault(request: Request, opts: CancelFault):
+    """让后续回收流程中的服务端取消进入指定故障模式：
+
+    - ``""``：关闭注入，恢复正常；
+    - ``hang``：取消调用在独立工作线程中阻塞 ``hang_seconds`` 秒，
+      用于验证取消卡住时事件循环（含本接口与 /pool/stats）仍响应、
+      取消超时后旧连接被关闭并补位；
+    - ``error``：取消调用直接报错，验证报错即更换连接。
+    """
+    pool: AsyncPool = request.app.state.pool
+    pool.cancel_fault = opts.mode
+    if opts.hang_seconds is not None:
+        pool.cfg.cancel_fault_seconds = opts.hang_seconds
+    logger.warning("server-cancel fault injection set to %r (hang=%.1fs)",
+                   pool.cancel_fault, pool.cfg.cancel_fault_seconds)
+    return {"mode": pool.cancel_fault,
+            "hang_seconds": pool.cfg.cancel_fault_seconds}
 
 
 @app.post("/demo/burst", summary="演示：并发打满连接池，观察排队")
